@@ -2,6 +2,8 @@ package io.kestra.jdbc.runner;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.kestra.core.contexts.KestraContext;
+import io.kestra.core.killswitch.EvaluationType;
+import io.kestra.core.killswitch.KillSwitchService;
 import io.kestra.core.exceptions.DeserializationException;
 import io.kestra.core.exceptions.FlowNotFoundException;
 import io.kestra.core.exceptions.InternalException;
@@ -23,7 +25,6 @@ import io.kestra.core.queues.QueueInterface;
 import io.kestra.core.repositories.TriggerRepositoryInterface;
 import io.kestra.core.runners.*;
 import io.kestra.core.runners.Executor;
-import io.kestra.core.server.ClusterEvent;
 import io.kestra.core.server.Metric;
 import io.kestra.core.server.ServiceStateChangeEvent;
 import io.kestra.core.server.ServiceType;
@@ -78,6 +79,9 @@ import static io.kestra.core.utils.Rethrow.*;
 @Slf4j
 public class JdbcExecutor implements ExecutorInterface {
     private static final ObjectMapper MAPPER = JdbcMapper.of();
+    private static final String IGNORING_EXECUTION_MSG = "Ignoring execution {} because there is a kill switch on it";
+    private static final String CANCELLING_EXECUTION_MSG = "Cancelling execution {} because there is a kill switch on it";
+    private static final String KILLING_EXECUTION_MSG = "Killing execution {} because there is a kill switch on it";
 
     private final ScheduledExecutorService scheduledDelay = Executors.newSingleThreadScheduledExecutor();
     private ScheduledFuture<?> executionDelayFuture;
@@ -170,7 +174,7 @@ public class JdbcExecutor implements ExecutorInterface {
     private WorkerGroupService workerGroupService;
 
     @Inject
-    private SkipExecutionService skipExecutionService;
+    private KillSwitchService killSwitchService;
 
     @Inject
     private AbstractJdbcWorkerJobRunningRepository workerJobRunningRepository;
@@ -486,9 +490,9 @@ public class JdbcExecutor implements ExecutorInterface {
             .forEach(workerJobRunning -> {
                 // WorkerTaskRunning
                 if (workerJobRunning instanceof WorkerTaskRunning workerTaskRunning) {
-                    if (skipExecutionService.skipExecution(workerTaskRunning.getTaskRun())) {
-                        // if the execution is skipped, we remove the workerTaskRunning and skip its resubmission
-                        log.warn("Skipping execution {}", workerTaskRunning.getTaskRun().getExecutionId());
+                    if (killSwitchService.evaluate(workerTaskRunning.getTaskRun()) != EvaluationType.PASS) {
+                        // if the execution is switch-killed, we remove the workerTaskRunning and skip its resubmission
+                        log.warn("Ignoring worker job resubmission for execution {} because there is a kill switch for it", workerTaskRunning.getTaskRun().getExecutionId());
                         workerJobRunningRepository.deleteByKey(workerTaskRunning.uid());
                     } else {
                         try {
@@ -546,9 +550,14 @@ public class JdbcExecutor implements ExecutorInterface {
         }
 
         Execution message = either.getLeft();
-        if (skipExecutionService.skipExecution(message)) {
-            log.warn("Skipping execution {}", message.getId());
-            return;
+
+        EvaluationType evaluationType = killSwitchService.evaluate(message);
+        if (evaluationType != EvaluationType.PASS) {
+            // to avoid loops with EvaluationType.KILL, we should not kill when the execution is killing
+            if (evaluationType != EvaluationType.KILL || (message.getState().getCurrent() != State.Type.KILLING && message.getState().getCurrent() != State.Type.KILLED)) {
+                handleKillSwitchedExecution(evaluationType, message);
+                return;
+            }
         }
 
         Executor result = executionRepository.lock(message.getId(), pair -> {
@@ -786,8 +795,9 @@ public class JdbcExecutor implements ExecutorInterface {
         }
 
         WorkerTaskResult message = either.getLeft();
-        if (skipExecutionService.skipExecution(message.getTaskRun())) {
-            log.warn("Skipping execution {}", message.getTaskRun().getExecutionId());
+        EvaluationType evaluationType = killSwitchService.evaluate(message.getTaskRun());
+        if (evaluationType != EvaluationType.PASS) {
+            handleKillSwitchedWorkerTaskResult(evaluationType, message);
             return;
         }
 
@@ -848,12 +858,15 @@ public class JdbcExecutor implements ExecutorInterface {
         }
 
         SubflowExecutionResult message = either.getLeft();
-        if (skipExecutionService.skipExecution(message.getExecutionId())) {
-            log.warn("Skipping execution {}", message.getExecutionId());
+
+        // we filter all messages for which there is a kill switch as the kill switch will apply to the child execution anyway
+        if (killSwitchService.evaluate(message.getExecutionId()) != EvaluationType.PASS) {
+            log.warn("Ignoring subflow execution result for child execution {} as there is a kill switch in it", message.getExecutionId());
             return;
         }
-        if (skipExecutionService.skipExecution(message.getParentTaskRun())) {
-            log.warn("Skipping execution {}", message.getParentTaskRun().getExecutionId());
+        // we filter all messages for which there is a kill switch as the kill switch will apply to the parent execution anyway
+        if (killSwitchService.evaluate(message.getParentTaskRun()) != EvaluationType.PASS) {
+            log.warn("Ignoring subflow execution result for parent execution {} as there is a kill switch in it", message.getParentTaskRun().getExecutionId());
             return;
         }
 
@@ -964,12 +977,15 @@ public class JdbcExecutor implements ExecutorInterface {
         }
 
         SubflowExecutionEnd message = either.getLeft();
-        if (skipExecutionService.skipExecution(message.getParentExecutionId())) {
-            log.warn("Skipping execution {}", message.getParentExecutionId());
+
+        // we filter all messages for which there is a kill switch as the kill switch will apply to the child execution anyway
+        if (killSwitchService.evaluate(message.getChildExecution()) != EvaluationType.PASS) {
+            log.warn("Ignoring subflow execution end for child execution {} as there is a kill switch in it", message.getChildExecution().getId());
             return;
         }
-        if (skipExecutionService.skipExecution(message.getChildExecution())) {
-            log.warn("Skipping execution {}", message.getChildExecution().getId());
+        // we filter all messages for which there is a kill switch as the kill switch will apply to the parent execution anyway
+        if (killSwitchService.evaluate(message.getParentExecutionId()) != EvaluationType.PASS) {
+            log.warn("Ignoring subflow execution end for parent execution {} as there is a kill switch in it", message.getParentExecutionId());
             return;
         }
 
@@ -1033,8 +1049,8 @@ public class JdbcExecutor implements ExecutorInterface {
             return;
         }
 
-        if (skipExecutionService.skipExecution(killedExecution.getExecutionId())) {
-            log.warn("Skipping execution {}", killedExecution.getExecutionId());
+        if (killSwitchService.evaluate(killedExecution.getExecutionId()) == EvaluationType.IGNORE) { // we process other types of evaluation
+            log.warn(IGNORING_EXECUTION_MSG, killedExecution.getExecutionId());
             return;
         }
 
@@ -1526,6 +1542,50 @@ public class JdbcExecutor implements ExecutorInterface {
         }
 
         return executor.withExecution(failedExecutionWithLog.execution(), "exception");
+    }
+
+    private void handleKillSwitchedExecution(EvaluationType evaluationType, Execution message) {
+        handleKillSwitchedExecution(evaluationType, message.getTenantId(), message.getId());
+    }
+
+    private void handleKillSwitchedWorkerTaskResult(EvaluationType evaluationType, WorkerTaskResult message) {
+        handleKillSwitchedExecution(evaluationType, message.getTaskRun().getTenantId(), message.getTaskRun().getExecutionId());
+    }
+
+    private void handleKillSwitchedExecution(EvaluationType evaluationType, String tenantId, String executionId) {
+        if (evaluationType == EvaluationType.IGNORE) {
+            log.warn(IGNORING_EXECUTION_MSG, executionId);
+        }
+        else if (evaluationType == EvaluationType.KILL) {
+            log.warn(KILLING_EXECUTION_MSG, executionId);
+            killExecution(tenantId, executionId);
+        }
+        else if (evaluationType == EvaluationType.CANCEL) {
+            log.warn(CANCELLING_EXECUTION_MSG, executionId);
+            cancelExecution(tenantId, executionId);
+        }
+    }
+
+    private void killExecution(String tenantId, String executionId) {
+        try {
+            killQueue.emit(ExecutionKilledExecution.builder()
+                .tenantId(tenantId)
+                .executionId(executionId)
+                .isOnKillCascade(true)
+                .state(ExecutionKilled.State.REQUESTED)
+                .build());
+        } catch (QueueException e) {
+            log.error("Unable to kill the execution {}", executionId, e);
+        }
+    }
+
+    private void cancelExecution(String tenantId, String executionId) {
+        // TODO we should use lock to avoid potential concurrent update of the execution (2.0 task)
+        executionRepository.findById(tenantId, executionId).ifPresent(execution -> {
+            if (!execution.getState().isTerminated()) {
+                executionRepository.save(execution.withState(State.Type.CANCELLED));
+            }
+        });
     }
 
     /**
